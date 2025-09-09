@@ -346,6 +346,9 @@ class UDP_sender:
     """Classe de compatibilidade que mapeia para UnityCommunicator"""
     
     _communicator = UnityCommunicator()
+    # simple debounce state to avoid duplicate rapid sends
+    _last_sent_times = {}
+    _debounce_seconds = 0.2  # ignore same action within 200 ms
     
     @classmethod
     def init_zmq_socket(cls, broadcast_duration=3.0):
@@ -360,6 +363,19 @@ class UDP_sender:
     @classmethod
     def enviar_sinal(cls, action: str) -> bool:
         """Envia sinal de ação"""
+        # debounce: avoid sending the same action repeatedly in a short window
+        try:
+            now = time.time()
+            key = action.lower()
+            last = cls._last_sent_times.get(key)
+            if last is not None and (now - last) < cls._debounce_seconds:
+                # skip duplicate
+                print(f"Debounce: skipping duplicate action '{action}' (last sent {now-last:.3f}s ago)")
+                return False
+            cls._last_sent_times[key] = now
+        except Exception:
+            # if anything goes wrong in debounce, proceed to send (fail-open)
+            pass
         if action.lower() == 'direita':
             return cls._communicator.send_hand_command('direita')
         elif action.lower() == 'esquerda':

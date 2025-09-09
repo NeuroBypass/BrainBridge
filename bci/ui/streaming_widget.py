@@ -88,13 +88,16 @@ class StreamingWidget(QWidget):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # Default values; prefer HardThinking canonical config when available
         self.channels = 16
-        self.window_size = 400  # fallback: 3.2s @ 125Hz
+        # Force canonical window_size to 250 (HardThinking canonical)
+        self.window_size = 250  # 2s @ 125Hz
         try:
             # HardThinking config module was added to sys.path earlier when locating adapter
-            from config import get_config as _ht_get_config
-            _cfg = _ht_get_config()
-            self.window_size = int(_cfg.data.window_size)
-            self.channels = int(_cfg.data.channels)
+            _ht_cfg_mod = importlib.import_module('config')
+            _ht_get_config = getattr(_ht_cfg_mod, 'get_config', None)
+            if _ht_get_config:
+                _cfg = _ht_get_config()
+                self.window_size = int(_cfg.data.window_size)
+                self.channels = int(_cfg.data.channels)
         except Exception:
             # keep fallbacks
             pass
@@ -103,6 +106,8 @@ class StreamingWidget(QWidget):
         self.predictions = deque(maxlen=50)  # Últimas predições
         # Buffer should hold several windows worth of samples; keep a generous maxlen
         self.eeg_buffer = deque(maxlen=max(1000, self.window_size * 4))  # Buffer para dados EEG
+        # Lock to ensure only the first prediction in an AI window is used
+        self.prediction_locked = False
 
     # Estados do servidor UDP
         self.udp_server_active = False
@@ -125,10 +130,13 @@ class StreamingWidget(QWidget):
         self.waiting_for_response = False
         self.response_received = False
 
-    # Controle de janela de tempo para IA (5 segundos de previsão permitida)
+    # Controle de janela de tempo para IA (configurável; default reduzido)
         self.ai_prediction_enabled = False
         self.task_start_time = None
-        self.ai_window_duration = 5000  # 5 segundos em ms
+        # Reduce default AI window to 2 seconds to send triggers sooner (milliseconds)
+        self.ai_window_duration = 2000  # 2 segundos em ms
+        # Fallback interval for automatic game actions (was 30s); reduce to 10s
+        self.game_action_interval = 10000  # 10 segundos in ms
 
     # Variáveis para cálculo de acurácia
         self.accuracy_data = []  # Lista de tuplas (cor_esperada, trigger_real)
@@ -611,8 +619,8 @@ class StreamingWidget(QWidget):
                 # O próximo sinal será enviado apenas após receber CORRECT/WRONG
                 QTimer.singleShot(1000, self.send_next_random_signal)  # Aguardar 1 segundo para inicializar
                 
-                # Manter timer como fallback caso não receba resposta (a cada 30 segundos)
-                self.game_action_timer.start(30000)
+                # Manter timer como fallback caso não receba resposta (usar game_action_interval)
+                self.game_action_timer.start(self.game_action_interval)
             
             try:
                 # Usar logger OpenBCI se disponível
@@ -769,6 +777,8 @@ class StreamingWidget(QWidget):
             
             # Abrir janela de IA por 5 segundos (fallback)
             self.ai_prediction_enabled = True
+            # allow the first prediction in this new AI window
+            self.prediction_locked = False
             self.task_start_time = time.time() * 1000  # timestamp em ms
             print(f"🤖 Janela de IA aberta por {self.ai_window_duration/1000}s (fallback)")
             
@@ -795,6 +805,8 @@ class StreamingWidget(QWidget):
             
             # Abrir janela de IA por 5 segundos
             self.ai_prediction_enabled = True
+            # allow the first prediction in this new AI window
+            self.prediction_locked = False
             self.task_start_time = time.time() * 1000  # timestamp em ms
             print(f"🤖 Janela de IA aberta por {self.ai_window_duration/1000}s")
             
@@ -854,9 +866,9 @@ class StreamingWidget(QWidget):
             # Feedback visual
             task_name = "jogo" if self.task_combo.currentText() == "Jogo" else "gravação"
             if marker_type == "T1":
-                self.recording_label.setText(f"{'Jogando' if task_name == 'jogo' else 'Gravando'} - Marcador T1 adicionado (T0 em 400 amostras)")
+                self.recording_label.setText(f"{'Jogando' if task_name == 'jogo' else 'Gravando'} - Marcador T1 adicionado (T0 em {self.window_size} amostras)")
             elif marker_type == "T2":
-                self.recording_label.setText(f"{'Jogando' if task_name == 'jogo' else 'Gravando'} - Marcador T2 adicionado (T0 em 400 amostras)")
+                self.recording_label.setText(f"{'Jogando' if task_name == 'jogo' else 'Gravando'} - Marcador T2 adicionado (T0 em {self.window_size} amostras)")
             
             # Resetar texto após 3 segundos
             QTimer.singleShot(3000, self.reset_recording_label)
@@ -1133,11 +1145,56 @@ class StreamingWidget(QWidget):
 
                 self.model = tf_model
                 self.model_type = 'tensorflow'
-                print(f"Modelo TensorFlow carregado: {model_path}")
+                # Inspect model input shape and store for runtime adaptation
                 try:
-                    self.model_status_label.setText(f"Modelo carregado: {os.path.basename(model_path)}")
+                    inp_shape = None
+                    try:
+                        # Keras model: model.input_shape or model.inputs[0].shape
+                        if hasattr(self.model, 'input_shape') and self.model.input_shape is not None:
+                            inp_shape = tuple(self.model.input_shape)
+                        elif hasattr(self.model, 'inputs') and getattr(self.model, 'inputs'):
+                            inp_shape = tuple(self.model.inputs[0].shape.as_list())
+                    except Exception:
+                        inp_shape = None
+
+                    self.model_input_shape = inp_shape
+                    print(f"Modelo TensorFlow carregado: {model_path} (input_shape={self.model_input_shape})")
+                    try:
+                        self.model_status_label.setText(f"Modelo carregado: {os.path.basename(model_path)}")
+                    except Exception:
+                        pass
                 except Exception:
-                    pass
+                    print(f"Modelo TensorFlow carregado: {model_path} (input_shape: unknown)")
+                    self.model_input_shape = None
+
+                # If the model expects a different time dimension than runtime window_size,
+                # attempt to detect and warn. We'll still try to adapt at predict time.
+                try:
+                    if self.model_input_shape is not None:
+                        # Typical shape: (None, time_steps, channels) or (time_steps, channels)
+                        ms = list(self.model_input_shape)
+                        # remove None or batch dim
+                        if len(ms) == 3 and (ms[0] is None or ms[0] == -1):
+                            model_time = int(ms[1]) if ms[1] is not None else None
+                            model_channels = int(ms[2]) if ms[2] is not None else None
+                        elif len(ms) == 2:
+                            model_time = int(ms[0]) if ms[0] is not None else None
+                            model_channels = int(ms[1]) if ms[1] is not None else None
+                        else:
+                            model_time = None
+                            model_channels = None
+
+                        self.model_expected_time = model_time
+                        self.model_expected_channels = model_channels
+                        if model_time is not None and model_time != self.window_size:
+                            print(f"Aviso: modelo espera {model_time} timesteps, runtime window_size={self.window_size}. Tentarei adaptar no predict.")
+                    else:
+                        self.model_expected_time = None
+                        self.model_expected_channels = None
+                except Exception:
+                    self.model_expected_time = None
+                    self.model_expected_channels = None
+
                 return True
 
             # Tentar PyTorch
@@ -1385,6 +1442,9 @@ class StreamingWidget(QWidget):
         """Faz predição do movimento com o modelo CNN"""
         if not self.game_mode or self.model is None:
             return
+        # If already used a prediction in this window, ignore further predictions
+        if getattr(self, 'prediction_locked', False):
+            return
         
         # Verificar se a IA pode fazer previsões (janela de 5 segundos)
         if not self.ai_prediction_enabled:
@@ -1410,11 +1470,44 @@ class StreamingWidget(QWidget):
                 eeg_data[:, ch] = (channel_data - channel_mean) / iqr
             
             # Escolha entre inferência TensorFlow e PyTorch
+            # Before inference, adapt eeg_data time dimension to model if necessary
+            try:
+                target_time = getattr(self, 'model_expected_time', None)
+                target_channels = getattr(self, 'model_expected_channels', None)
+            except Exception:
+                target_time = None
+                target_channels = None
+
+            # ensure eeg_data shape is (time, channels)
+            # If model expects different time length, trim or pad (simple nearest strategy)
+            if target_time is not None and target_time != eeg_data.shape[0]:
+                if target_time < eeg_data.shape[0]:
+                    # trim center region
+                    start = (eeg_data.shape[0] - target_time) // 2
+                    eeg_data = eeg_data[start:start + target_time, :]
+                else:
+                    # pad zeros at end
+                    pad_rows = target_time - eeg_data.shape[0]
+                    pad = np.zeros((pad_rows, eeg_data.shape[1]), dtype=eeg_data.dtype)
+                    eeg_data = np.vstack([eeg_data, pad])
+
+            # If model expects different channels, try to adapt (trim or pad with zeros)
+            if target_channels is not None and target_channels != eeg_data.shape[1]:
+                if target_channels < eeg_data.shape[1]:
+                    eeg_data = eeg_data[:, :target_channels]
+                else:
+                    pad_cols = target_channels - eeg_data.shape[1]
+                    pad = np.zeros((eeg_data.shape[0], pad_cols), dtype=eeg_data.dtype)
+                    eeg_data = np.hstack([eeg_data, pad])
+
+            # Now do inference
             if self.model_type == 'tensorflow':
                 # prefer in-process adapter if available
                 if self.tf_adapter is not None and self.model is not None:
-                    # reshape according to runtime window_size and channels
-                    X = eeg_data.reshape(1, self.window_size, self.channels)
+                    # reshape according to model expected dims (time, channels)
+                    time_dim = getattr(self, 'model_expected_time', eeg_data.shape[0])
+                    chan_dim = getattr(self, 'model_expected_channels', eeg_data.shape[1])
+                    X = eeg_data.reshape(1, time_dim, chan_dim)
                     probs = self.tf_adapter.predict_proba(self.model, X)
                     pred = int(np.argmax(probs, axis=1)[0])
                     conf = float(probs[0][pred])
@@ -1468,6 +1561,12 @@ class StreamingWidget(QWidget):
             else:
                 self.prob_right_label.setText(f"Mão Direita: {right_prob:.1%}")
                 self.send_udp_signal('direita')  # Enviar sinal UDP 
+
+            # lock to prevent further predictions in this AI window until Unity replies
+            try:
+                self.prediction_locked = True
+            except Exception:
+                pass
             
             # Atualizar estilo baseado na predição
             if pred == 0:  # Mão esquerda
