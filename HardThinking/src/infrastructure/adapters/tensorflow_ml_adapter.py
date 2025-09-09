@@ -10,6 +10,7 @@ invocados.
 
 import os
 import importlib
+import traceback
 from typing import Dict, Any, Optional
 import numpy as np
 from ...application.ports.secondary_ports import MLModelPort
@@ -29,6 +30,9 @@ class TensorFlowMLAdapter(MLModelPort):
         self._keras = None
         self._keras_layers = None
         self._keras_callbacks = None
+        self.import_error = None
+        self.import_traceback = None
+
         # tentar importar tensorflow quando instanciado, mas não falhar aqui
         try:
             self._tf = importlib.import_module('tensorflow')
@@ -43,14 +47,26 @@ class TensorFlowMLAdapter(MLModelPort):
             # não propagar a exceção aqui — deixar o sistema inicializar e
             # falhar apenas ao tentar treinar/predizer, com mensagem útil.
             self.available = False
+            # store exception and traceback for diagnostics
+            self.import_error = e
+            self.import_traceback = traceback.format_exc()
 
     def _require_tf(self):
         if not self.available or self._tf is None:
-            raise RuntimeError(
+            msg = (
                 "TensorFlow não disponível no ambiente. Instale uma versão compatível do "
                 "TensorFlow e as dependências de runtime (ex: Microsoft Visual C++). "
                 "Veja: https://www.tensorflow.org/install/errors"
             )
+            if getattr(self, 'import_error', None) is not None:
+                msg += f"\nCausa original: {repr(self.import_error)}"
+                # keep traceback short but helpful
+                if getattr(self, 'import_traceback', None):
+                    tb_lines = self.import_traceback.strip().splitlines()
+                    # include only last 8 lines of traceback
+                    msg += "\nTraceback (most recent call last):\n" + "\n".join(tb_lines[-8:])
+
+            raise RuntimeError(msg)
 
     def create_model(self, architecture: str, hyperparameters: Dict[str, Any]):
         self._require_tf()

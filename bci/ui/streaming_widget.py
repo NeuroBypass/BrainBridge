@@ -86,10 +86,23 @@ class StreamingWidget(QWidget):
         self.model_type = None  # 'pytorch' or 'tensorflow'
         self.tf_adapter = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.window_size = 400  # 3.2s @ 125Hz
+        # Default values; prefer HardThinking canonical config when available
+        self.channels = 16
+        self.window_size = 400  # fallback: 3.2s @ 125Hz
+        try:
+            # HardThinking config module was added to sys.path earlier when locating adapter
+            from config import get_config as _ht_get_config
+            _cfg = _ht_get_config()
+            self.window_size = int(_cfg.data.window_size)
+            self.channels = int(_cfg.data.channels)
+        except Exception:
+            # keep fallbacks
+            pass
+
         self.samples_since_last_prediction = 0
         self.predictions = deque(maxlen=50)  # Últimas predições
-        self.eeg_buffer = deque(maxlen=1000)  # Buffer para dados EEG
+        # Buffer should hold several windows worth of samples; keep a generous maxlen
+        self.eeg_buffer = deque(maxlen=max(1000, self.window_size * 4))  # Buffer para dados EEG
 
     # Estados do servidor UDP
         self.udp_server_active = False
@@ -1386,8 +1399,8 @@ class StreamingWidget(QWidget):
                 return
             
         try:
-            # Normalização por canal
-            for ch in range(16):
+            # Normalização por canal (usa self.channels)
+            for ch in range(self.channels):
                 channel_data = eeg_data[:, ch]
                 q75, q25 = np.percentile(channel_data, [75, 25])
                 iqr = q75 - q25
@@ -1400,7 +1413,8 @@ class StreamingWidget(QWidget):
             if self.model_type == 'tensorflow':
                 # prefer in-process adapter if available
                 if self.tf_adapter is not None and self.model is not None:
-                    X = eeg_data.reshape(1, self.window_size, 16)
+                    # reshape according to runtime window_size and channels
+                    X = eeg_data.reshape(1, self.window_size, self.channels)
                     probs = self.tf_adapter.predict_proba(self.model, X)
                     pred = int(np.argmax(probs, axis=1)[0])
                     conf = float(probs[0][pred])
@@ -1427,7 +1441,7 @@ class StreamingWidget(QWidget):
                         print(f'Error calling inference server: {e}')
                         return
             else:
-                # Transpor para (16, 400) e criar tensor para PyTorch EEGNet
+                # Transpor para (channels, window_size) e criar tensor para PyTorch EEGNet
                 eeg_array = eeg_data.T
                 eeg_tensor = torch.FloatTensor(eeg_array).unsqueeze(0).unsqueeze(0)
                 eeg_tensor = eeg_tensor.to(self.device)
@@ -1474,8 +1488,11 @@ class StreamingWidget(QWidget):
         
         # Adicionar ao buffer de dados e verificar predição
         if self.game_mode:
-            # Garantir que temos 16 canais
-            eeg_data = data[:16] if len(data) >= 16 else data + [0.0] * (16 - len(data))
+            # Garantir que temos 'channels' canais
+            if len(data) >= self.channels:
+                eeg_data = data[:self.channels]
+            else:
+                eeg_data = data + [0.0] * (self.channels - len(data))
             self.eeg_buffer.append(eeg_data)
             self.samples_since_last_prediction += 1
             
@@ -1492,12 +1509,15 @@ class StreamingWidget(QWidget):
                 marker = self.pending_marker
                 self.pending_marker = None  # Limpar marcador pendente
                 
-                # Garantir que temos 16 canais
-                if len(data) == 16:
+                # Garantir que temos 'channels' canais
+                if len(data) == self.channels:
                     self.csv_logger.log_sample(data, marker)
                 else:
                     # Ajustar dados se necessário
-                    eeg_data = data[:16] if len(data) >= 16 else data + [0.0] * (16 - len(data))
+                    if len(data) >= self.channels:
+                        eeg_data = data[:self.channels]
+                    else:
+                        eeg_data = data + [0.0] * (self.channels - len(data))
                     self.csv_logger.log_sample(eeg_data, marker)
             else:
                 # Logger simples (fallback)

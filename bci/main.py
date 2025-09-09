@@ -19,6 +19,15 @@ import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from collections import deque
+# Preload TensorFlow runtime (if installed) before importing any GUI or
+# other native-extension libraries. This reduces the chance of Windows
+# DLL initialization conflicts (common when mixing TF and PyTorch/PyQt).
+try:
+    import tensorflow as _tf
+    print(f'Preloaded TensorFlow: {_tf.__version__}')
+except Exception:
+    pass
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QTabWidget, QLabel, QLineEdit, 
                            QPushButton, QComboBox, QSpinBox, QTextEdit,
@@ -34,7 +43,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import traceback
-
 # Detectar se estamos executando como módulo ou script direto
 if __name__ == "__main__" and __package__ is None:
     # Executando como script direto, adicionar o diretório pai ao path
