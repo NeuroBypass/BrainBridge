@@ -1,0 +1,34 @@
+{
+  "id": "2a9ceb83-78fc-468a-a9af-3b1b54ddeb3f",
+  "name": "model_single_subject_1_subjects",
+  "architecture": "CNN_1D",
+  "status": "trained",
+  "file_path": "files/2a9ceb83-78fc-468a-a9af-3b1b54ddeb3f.keras",
+  "subject_ids": [
+    "S004"
+  ],
+  "training_metrics": {
+    "accuracy": 0.9808743000030518,
+    "precision": null,
+    "recall": null,
+    "f1_score": null,
+    "loss": 0.05683377757668495,
+    "val_accuracy": 0.9347826242446899,
+    "val_loss": 0.18069390952587128,
+    "training_time": 4.8520848751068115,
+    "epochs_trained": 11
+  },
+  "hyperparameters": {
+    "input_shape": [
+      250,
+      16
+    ],
+    "num_classes": 2
+  },
+  "metadata": {
+    "training_strategy": "single_subject"
+  },
+  "created_at": "2025-09-09T14:17:13.444092",
+  "updated_at": "2025-09-09T14:17:29.751058",
+  "trained_at": "2025-09-09T14:17:29.751058"
+}

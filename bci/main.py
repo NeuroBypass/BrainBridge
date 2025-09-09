@@ -33,6 +33,7 @@ from matplotlib import pyplot as plt
 import torch
 import torch.nn as nn
 import numpy as np
+import traceback
 
 # Detectar se estamos executando como módulo ou script direto
 if __name__ == "__main__" and __package__ is None:
@@ -162,6 +163,14 @@ def main():
     
     # Criar aplicação PyQt5
     app = QApplication(sys.argv)
+    # Inicializar captura/log de erros do PyQt -> faz com que qualquer QMessageBox
+    # mostrado também seja impresso no terminal (stderr) e que exceções não tratadas
+    # sejam logadas e exibidas em um QMessageBox.
+    try:
+        setup_qt_error_logging()
+    except Exception:
+        # Não falhar a inicialização da aplicação se a instrumentação falhar
+        print("Aviso: não foi possível habilitar o logging de QMessageBox.", file=sys.stderr)
     
     if BCIMainWindow:
         # Usar a interface principal modularizada
@@ -184,6 +193,83 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def setup_qt_error_logging():
+    """Monkeypatch QMessageBox to also print its messages to stderr and
+    install an excepthook that logs unhandled exceptions to stderr and shows
+    a message box (which will be logged by the patched exec_).
+
+    This is safe to call after PyQt5 is imported and a QApplication exists.
+    """
+    # Local import to avoid issues if PyQt isn't available at import time
+    from PyQt5.QtWidgets import QMessageBox
+
+    # Patch instance exec_ to log dialog contents
+    orig_exec = QMessageBox.exec_
+
+    def exec_with_log(self, *args, **kwargs):
+        try:
+            title = self.windowTitle() if hasattr(self, 'windowTitle') else ''
+            text = self.text() if hasattr(self, 'text') else ''
+            info = self.informativeText() if hasattr(self, 'informativeText') else ''
+            detail = self.detailedText() if hasattr(self, 'detailedText') else ''
+        except Exception:
+            title = text = info = detail = '<unavailable>'
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] PyQt5 QMessageBox - {title}: {text}", file=sys.stderr)
+        if info:
+            print(f"  Info: {info}", file=sys.stderr)
+        if detail:
+            print(f"  Details: {detail}", file=sys.stderr)
+        return orig_exec(self, *args, **kwargs)
+
+    QMessageBox.exec_ = exec_with_log
+
+    # Patch convenience/static methods like QMessageBox.critical(...)
+    for name in ('critical', 'warning', 'information', 'question'):
+        orig = getattr(QMessageBox, name, None)
+        if orig is None:
+            continue
+
+        def make_wrapper(orig_func):
+            def wrapper(*args, **kwargs):
+                try:
+                    # signature: (parent, title, text, ...)
+                    title = args[1] if len(args) > 1 else kwargs.get('title', '')
+                    text = args[2] if len(args) > 2 else kwargs.get('text', '')
+                except Exception:
+                    title = text = '<unavailable>'
+                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"[{ts}] PyQt5 QMessageBox.{orig_func.__name__} - {title}: {text}", file=sys.stderr)
+                return orig_func(*args, **kwargs)
+            return wrapper
+
+        setattr(QMessageBox, name, make_wrapper(orig))
+
+    # Install a excepthook that logs to stderr and shows a message box
+    def qt_excepthook(exc_type, exc_value, exc_tb):
+        tb = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] Unhandled exception:\n{tb}", file=sys.stderr)
+        try:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Unhandled Exception")
+            msg.setText(str(exc_value))
+            msg.setDetailedText(tb)
+            # exec_ is patched and will log this dialog too
+            msg.exec_()
+        except Exception:
+            # Se algo falhar ao mostrar o dialog, apenas continue
+            pass
+        # Chamar o excepthook original para manter comportamento padrão
+        try:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = qt_excepthook
 
 
 

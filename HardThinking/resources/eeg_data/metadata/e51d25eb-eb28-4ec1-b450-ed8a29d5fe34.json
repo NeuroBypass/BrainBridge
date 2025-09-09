@@ -1,0 +1,35 @@
+{
+  "id": "e51d25eb-eb28-4ec1-b450-ed8a29d5fe34",
+  "name": "model_single_subject_1_subjects",
+  "architecture": "CNN_1D",
+  "status": "trained",
+  "file_path": "files/e51d25eb-eb28-4ec1-b450-ed8a29d5fe34.h5",
+  "subject_ids": [
+    "S058"
+  ],
+  "training_metrics": {
+    "accuracy": 0.9925373196601868,
+    "precision": null,
+    "recall": null,
+    "f1_score": null,
+    "loss": 0.01737760379910469,
+    "val_accuracy": 0.9558823704719543,
+    "val_loss": 0.10487011075019836,
+    "training_time": 11.947144508361816,
+    "epochs_trained": 39
+  },
+  "hyperparameters": {
+    "input_shape": [
+      250,
+      16
+    ],
+    "num_classes": 2,
+    "learning_rate": 0.001
+  },
+  "metadata": {
+    "training_strategy": "single_subject"
+  },
+  "created_at": "2025-09-09T10:52:11.513770",
+  "updated_at": "2025-09-09T10:52:30.857469",
+  "trained_at": "2025-09-09T10:52:30.857469"
+}

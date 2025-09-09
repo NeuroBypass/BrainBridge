@@ -4,21 +4,44 @@ import time
 import zmq
 import socket
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from collections import deque
 import numpy as np
 import torch
+import sys
+import importlib
+from pathlib import Path
+import traceback
+import time
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                            QPushButton, QGroupBox, QComboBox, QGridLayout,
                            QProgressBar, QTextEdit, QMessageBox, QCheckBox,
-                           QLineEdit, QSpinBox)
+                           QLineEdit, QSpinBox, QDialog, QInputDialog)
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from ..database.database_manager import DatabaseManager
 from ..streaming_logic.streaming_thread import StreamingThread
 from ..configs.config import get_recording_path
 from .EEG_plot_widget import EEGPlotWidget
-from ..AI.EEGNet import EEGNet
+ # Prefer using HardThinking TensorFlow adapter for models
+try:
+    import importlib, sys
+    # Add HardThinking/src to sys.path if it exists
+    p = Path(__file__).resolve()
+    ht_src = None
+    for _ in range(6):
+        p = p.parent
+        candidate = p / 'HardThinking' / 'src'
+        if candidate.exists():
+            ht_src = str(candidate)
+            break
+    if ht_src and ht_src not in sys.path:
+        sys.path.insert(0, ht_src)
+    TensorFlowMLAdapter = importlib.import_module('infrastructure.adapters.tensorflow_ml_adapter').TensorFlowMLAdapter
+except Exception:
+    TensorFlowMLAdapter = None
+    print('Aviso: HardThinking TensorFlow adapter não encontrado. Funcionalidade de TF ficará indisponível.')
 from ..network.unity_communication import UDP_sender, UDP_receiver, UnityCommunicator
+from .training_dialog import TrainingDialog
 
 # Importar loggers
 try:
@@ -41,66 +64,74 @@ class StreamingWidget(QWidget):
     def __init__(self, db_manager: DatabaseManager, parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
-        self.streaming_thread = None
+
+    # Streaming / logging state
+        self.streaming_thread = None    
         self.csv_logger = None
         self.is_recording = False
         self.current_patient_id = None
         self.pending_marker = None  # Para marcadores pendentes no logger OpenBCI
         self.baseline_timer = QTimer()  # Timer para baseline
-        
-        # Timer de sessão
+
+    # Timer de sessão
         self.session_timer = QTimer()
         self.session_timer.timeout.connect(self.update_session_timer)
         self.session_start_time = None
         self.session_elapsed_seconds = 0
-        
+
         self.setup_ui()
-        
-        # Inicialização do modelo
+
+    # Inicialização do modelo
         self.model = None
+        self.model_type = None  # 'pytorch' or 'tensorflow'
+        self.tf_adapter = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.window_size = 400  # 3.2s @ 125Hz
         self.samples_since_last_prediction = 0
         self.predictions = deque(maxlen=50)  # Últimas predições
         self.eeg_buffer = deque(maxlen=1000)  # Buffer para dados EEG
-        
-        # Estados do servidor UDP
+
+    # Estados do servidor UDP
         self.udp_server_active = False
-        self.game_mode = False
         self.game_mode = False  # Flag para modo jogo
-        
-        # Inicializar comunicador Unity
+
+    # Inicializar comunicador Unity
         self.unity_communicator = UnityCommunicator()
         self.unity_communicator.set_message_callback(self._on_unity_message)
         self.unity_communicator.set_connection_callback(self._on_unity_connection)
-        
-        # Contadores para marcadores
+
+    # Contadores para marcadores
         self.t1_counter = 0
         self.t2_counter = 0
-        
-        # Timer para ações automáticas no jogo
+
+    # Timer para ações automáticas no jogo
         self.game_action_timer = QTimer()
         self.game_action_timer.timeout.connect(self.game_random_action)
-        
-        # Controle para aguardar resposta antes do próximo sinal
+
+    # Controle para aguardar resposta antes do próximo sinal
         self.waiting_for_response = False
         self.response_received = False
-        
-        # Controle de janela de tempo para IA (5 segundos de previsão permitida)
+
+    # Controle de janela de tempo para IA (5 segundos de previsão permitida)
         self.ai_prediction_enabled = False
         self.task_start_time = None
         self.ai_window_duration = 5000  # 5 segundos em ms
-        
-        # Variáveis para cálculo de acurácia
+
+    # Variáveis para cálculo de acurácia
         self.accuracy_data = []  # Lista de tuplas (cor_esperada, trigger_real)
         self.accuracy_correct = 0
         self.accuracy_total = 0
-        
-        # UDP receiver para acurácia (recebe mensagens do sistema externo)
+
+    # UDP receiver para acurácia (recebe mensagens do sistema externo)
         self.accuracy_udp_receiver = None
         self.accuracy_thread = None
-        
-        # Conectar signal para processar mensagens de acurácia
+
+    # Inference subprocess (when TF not importable in-process)
+        self.inference_proc = None
+        self.inference_port = 5001
+        self.inference_model_path = None
+
+    # Conectar signal para processar mensagens de acurácia
         self.accuracy_message_signal.connect(self.process_accuracy_message)
         
     def setup_ui(self):
@@ -324,6 +355,12 @@ class StreamingWidget(QWidget):
         self.ai_status_label.setAlignment(Qt.AlignCenter)
         game_layout.addWidget(self.ai_status_label)
 
+        # Label para status do modelo carregado
+        self.model_status_label = QLabel("Modelo: nenhum carregado")
+        self.model_status_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.model_status_label.setAlignment(Qt.AlignCenter)
+        game_layout.addWidget(self.model_status_label)
+
         game_group.setLayout(game_layout)
         layout.addWidget(game_group)
         
@@ -408,19 +445,7 @@ class StreamingWidget(QWidget):
             
             self.connect_btn.setText("Desconectar")
             self.connect_btn.setEnabled(False)
-            
-        else:
-            # Desconectar
-            if self.is_recording:
-                self.toggle_recording()
-            
-            self.streaming_thread.stop_streaming()
-            self.connect_btn.setText("Conectar")
-            self.record_btn.setEnabled(False)
-    
-    def toggle_udp_server(self):
-        """Liga/desliga o servidor UDP"""
-        if not self.udp_server_active:
+
             # Iniciar servidor UDP
             try:
                 if self.unity_communicator.start_server():
@@ -477,6 +502,45 @@ class StreamingWidget(QWidget):
                 print(f"Falha ao enviar sinal UDP para {direction}")
             return success
         return False
+
+    def toggle_udp_server(self):
+        """Inicia ou para o servidor UDP manualmente (conectado ao botão)."""
+        try:
+            if not self.udp_server_active:
+                # Tentar iniciar servidor
+                started = False
+                try:
+                    started = self.unity_communicator.start_server()
+                except Exception as e:
+                    print(f"Erro ao iniciar servidor UDP: {e}")
+
+                if started:
+                    self.udp_server_active = True
+                    self.udp_status_label.setText("Servidor UDP: Ligado")
+                    self.udp_status_label.setStyleSheet("color: green; font-weight: bold;")
+                    self.udp_toggle_btn.setText("Parar Servidor UDP")
+                    self.udp_toggle_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+                    self.udp_test_left_btn.setEnabled(True)
+                    self.udp_test_right_btn.setEnabled(True)
+                    QMessageBox.information(self, "Sucesso", "Servidor UDP iniciado com sucesso!\nBroadcast do IP enviado automaticamente.")
+                else:
+                    QMessageBox.critical(self, "Erro", "Falha ao iniciar servidor UDP")
+            else:
+                # Parar servidor
+                try:
+                    self.unity_communicator.stop_server()
+                except Exception:
+                    pass
+                self.udp_server_active = False
+                self.udp_status_label.setText("Servidor UDP: Desligado")
+                self.udp_status_label.setStyleSheet("color: red; font-weight: bold;")
+                self.udp_toggle_btn.setText("Iniciar Servidor UDP")
+                self.udp_toggle_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+                self.udp_test_left_btn.setEnabled(False)
+                self.udp_test_right_btn.setEnabled(False)
+                QMessageBox.information(self, "Sucesso", "Servidor UDP parado com sucesso!")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao alternar servidor UDP: {e}")
     
     def toggle_recording(self):
         """Inicia/para a gravação"""
@@ -583,9 +647,16 @@ class StreamingWidget(QWidget):
                 QMessageBox.critical(self, "Erro", f"Erro ao iniciar gravação: {e}")
         else:
             # Parar gravação
+            # Parar logging, mas manter referência para obter o caminho do arquivo
+            logger = None
             if self.csv_logger:
-                self.csv_logger.stop_logging()
-                self.csv_logger = None
+                logger = self.csv_logger
+                try:
+                    logger.stop_logging()
+                except Exception:
+                    pass
+            # Limpar a referência de longo prazo (UI não mais grava)
+            self.csv_logger = None
             
             self.is_recording = False
             self.game_mode = False  # Desativar modo jogo
@@ -631,7 +702,38 @@ class StreamingWidget(QWidget):
             self.session_elapsed_seconds = 0
             self.update_session_timer()
             
-            QMessageBox.information(self, "Sucesso", "Gravação finalizada!")
+            # Verificar se é tarefa de treino para mostrar popup de treinamento
+            current_task = self.task_combo.currentText()
+            print(f"[DEBUG] stop_recording: current_task={current_task}, logger_present={logger is not None}")
+            if current_task == "Treino":
+                # Obter informações para o treino
+                patient_name = self.patient_combo.currentText().split(" (ID:")[0]
+                csv_file_path = None
+                
+                # Obter caminho do arquivo CSV gravado a partir da referência local 'logger'
+                if USE_OPENBCI_LOGGER and hasattr(logger, 'get_full_path'):
+                    try:
+                        csv_file_path = logger.get_full_path()
+                    except Exception:
+                        csv_file_path = None
+                elif logger is not None and hasattr(logger, 'filename'):
+                    # Construir caminho completo para logger simples
+                    csv_file_path = str(get_recording_path(logger.filename))
+                
+                print(f"[DEBUG] stop_recording: csv_file_path={csv_file_path}")
+                if csv_file_path and os.path.exists(csv_file_path):
+                    # Iniciar fluxo automático de treino sem pedir confirmação
+                    # show_training_dialog agora suporta auto_start=True
+                    try:
+                        print("[DEBUG] stop_recording: launching auto training dialog")
+                        self.show_training_dialog(csv_file_path, self.current_patient_id, patient_name, auto_start=True)
+                    except Exception as e:
+                        print(f"[DEBUG] stop_recording: failed to start training dialog: {e}")
+                        QMessageBox.information(self, "Sucesso", "Gravação de treino finalizada!")
+                else:
+                    QMessageBox.information(self, "Sucesso", "Gravação de treino finalizada!")
+            else:
+                QMessageBox.information(self, "Sucesso", "Gravação finalizada!")
     
 
     def game_random_action(self):
@@ -850,38 +952,284 @@ class StreamingWidget(QWidget):
     def load_model(self):
         """Carrega modelo CNN para inferência"""
         try:
-            model_path = "bci/models/best_model.pth"
-            possible_paths = [
-            model_path,
-            f"../{model_path}",  
-            os.path.join(os.getcwd(), model_path)
+            current_dir = Path(__file__).parent.parent.parent
+
+            # Candidate directories to search for TensorFlow models (prefer .keras)
+            candidate_dirs = [
+                current_dir / 'bci' / 'models',    # bci/models
+                current_dir / 'models',            # workspace/models (if present)
+                current_dir / 'files',             # workspace/files
+                current_dir / 'HardThinking' / 'files',
+                Path(os.getcwd()) / 'bci' / 'models',
             ]
-            
-            model_found = False
-            for path in possible_paths:
-                if os.path.exists(path):
-                    model_path = path
-                    model_found = True
-                    break
-            
-            if not model_found:
-                QMessageBox.warning(self, "Erro", "Modelo não encontrado!")
-                return False
-            
-            self.model = EEGNet(n_channels=16, n_classes=2, n_samples=self.window_size)
-            state_dict = torch.load(model_path, map_location=self.device)
-            
-            # Carregar pesos
-            if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
-                self.model.load_state_dict(state_dict['model_state_dict'])
-            else:
-                self.model.load_state_dict(state_dict)
-                
-            self.model.to(self.device).eval()
-            return True
+
+            tf_candidates = []
+            for d in candidate_dirs:
+                try:
+                    if d.exists():
+                        tf_candidates.extend(list(d.glob('*.keras')))
+                        tf_candidates.extend(list(d.glob('*.h5')))
+                except Exception:
+                    continue
+
+            # If we found any TF models, pick the most recently modified
+            if tf_candidates:
+                tf_candidates = sorted(tf_candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+                chosen = str(tf_candidates[0])
+                print(f"Carregando modelo TensorFlow encontrado: {chosen}")
+                return self.load_model_from_path(chosen)
+
+            # No TF models found — fallback to PyTorch .pth as before
+            pth_candidates = [
+                current_dir / 'bci' / 'models' / 'best_model.pth',
+                current_dir / 'bci' / 'models' / 'best_model.pt',
+                Path(os.getcwd()) / 'bci' / 'models' / 'best_model.pth',
+            ]
+            for p in pth_candidates:
+                try:
+                    if p.exists():
+                        # Try TorchScript load
+                        try:
+                            self.model = torch.jit.load(str(p), map_location=self.device)
+                            self.model_type = 'pytorch'
+                            print(f"Modelo PyTorch carregado: {p}")
+                            return True
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            QMessageBox.warning(self, "Erro", "Modelo não encontrado! (busca por .keras/.h5 em bci/models, files, HardThinking/files)")
+            return False
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Erro ao carregar modelo: {e}")
             return False
+    def load_model_from_path(self, model_path: str) -> bool:
+        """Tenta carregar um modelo explicitamente a partir de um caminho.
+
+        Retorna True se carregado com sucesso, False caso contrário.
+        """
+        try:
+            # Delegar para adapter TensorFlow se for .h5
+            if model_path.endswith('.h5') or model_path.endswith('.keras'):
+                # localizar HardThinking adapter como em load_model
+                current_dir = Path(__file__).parent.parent.parent
+                hardthinking_src = None
+                for parent in current_dir.resolve().parents:
+                    candidate = parent / 'HardThinking' / 'src'
+                    if candidate.exists():
+                        hardthinking_src = candidate
+                        break
+
+                if hardthinking_src is None:
+                    print("Falha ao localizar HardThinking/src para carregar adapter TensorFlow")
+                    return False
+
+                hardthinking_root = hardthinking_src.parent
+                if str(hardthinking_root) not in sys.path:
+                    sys.path.insert(0, str(hardthinking_root))
+
+                # Tornar a importação do adapter mais tolerante a diferentes estruturas de pacote
+                hardthinking_root = hardthinking_src.parent
+                # garantir ambos caminhos no sys.path (src e seu pai)
+                for p in (str(hardthinking_src), str(hardthinking_root)):
+                    if p not in sys.path:
+                        sys.path.insert(0, p)
+
+                import_errors = []
+                TensorFlowMLAdapter = None
+                # Tentar importações em ordem provável
+                import_candidates = [
+                    'infrastructure.adapters.tensorflow_ml_adapter',
+                    'src.infrastructure.adapters.tensorflow_ml_adapter',
+                ]
+                for modname in import_candidates:
+                    try:
+                        m = importlib.import_module(modname)
+                        TensorFlowMLAdapter = getattr(m, 'TensorFlowMLAdapter', None)
+                        if TensorFlowMLAdapter:
+                            break
+                    except Exception as ie:
+                        import_errors.append((modname, str(ie)))
+
+                if TensorFlowMLAdapter is None:
+                    msg = 'Falha ao localizar TensorFlowMLAdapter. Tentativas:\n'
+                    for modname, err in import_errors:
+                        msg += f"  {modname}: {err}\n"
+                    print(msg)
+                    try:
+                        # gravar log de debug
+                        try:
+                            os.makedirs(str(Path(__file__).parent.parent / 'logs'), exist_ok=True)
+                            ts = time.strftime('%Y%m%d_%H%M%S')
+                            lf = Path(__file__).parent.parent / 'logs' / f'model_load_error_{ts}.log'
+                            with open(lf, 'w', encoding='utf-8') as fh:
+                                fh.write(msg + '\n')
+                        except Exception:
+                            lf = None
+                        label_txt = 'Erro: falha ao localizar adapter TF'
+                        if lf:
+                            label_txt += f" (ver {lf.name})"
+                        self.model_status_label.setText(label_txt)
+                    except Exception:
+                        pass
+                    return False
+
+                # Instanciar adapter e carregar o modelo com tratamento de erros
+                try:
+                    self.tf_adapter = TensorFlowMLAdapter(config={})
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(f'Falha ao instanciar TensorFlowMLAdapter: {e}\n{tb}')
+                    try:
+                        os.makedirs(str(Path(__file__).parent.parent / 'logs'), exist_ok=True)
+                        ts = time.strftime('%Y%m%d_%H%M%S')
+                        lf = Path(__file__).parent.parent / 'logs' / f'model_load_error_{ts}.log'
+                        with open(lf, 'w', encoding='utf-8') as fh:
+                            fh.write('Falha ao instanciar TensorFlowMLAdapter:\n')
+                            fh.write(tb)
+                        self.model_status_label.setText(f"Erro: instanciar adapter TF (ver {lf.name})")
+                    except Exception:
+                        pass
+                    return False
+
+                try:
+                    tf_model = self.tf_adapter.load_model(model_path)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(f'Exceção ao carregar modelo via adapter: {e}\n{tb}')
+                    try:
+                        os.makedirs(str(Path(__file__).parent.parent / 'logs'), exist_ok=True)
+                        ts = time.strftime('%Y%m%d_%H%M%S')
+                        lf = Path(__file__).parent.parent / 'logs' / f'model_load_error_{ts}.log'
+                        with open(lf, 'w', encoding='utf-8') as fh:
+                            fh.write('Exceção ao carregar modelo via adapter:\n')
+                            fh.write(tb)
+                        self.model_status_label.setText(f"Erro ao carregar modelo (ver {lf.name})")
+                    except Exception:
+                        pass
+                    return False
+
+                if tf_model is None:
+                    print('Falha ao carregar modelo .keras/.h5 via adapter: None retornado')
+                    try:
+                        self.model_status_label.setText('Erro: adapter retornou None ao carregar modelo')
+                    except Exception:
+                        pass
+                    return False
+
+                self.model = tf_model
+                self.model_type = 'tensorflow'
+                print(f"Modelo TensorFlow carregado: {model_path}")
+                try:
+                    self.model_status_label.setText(f"Modelo carregado: {os.path.basename(model_path)}")
+                except Exception:
+                    pass
+                return True
+
+            # Tentar PyTorch
+            if os.path.exists(model_path):
+                try:
+                    self.model = torch.jit.load(model_path, map_location=self.device)
+                    self.model_type = 'pytorch'
+                    print(f"Modelo PyTorch carregado: {model_path}")
+                    return True
+                except Exception as e:
+                    print(f"Falha ao carregar PyTorch: {e}")
+
+        except Exception as e:
+            print(f"Erro ao carregar modelo: {e}")
+
+        # If TF adapter not available in-process, try starting inference subprocess
+        # This allows the GUI process to remain TF-free and call the subprocess via HTTP
+        try:
+            if model_path.endswith('.keras') or model_path.endswith('.h5'):
+                # If we couldn't load in-process, start external inference server
+                try:
+                    # copy model to bci/models if necessary
+                    dest = Path(__file__).parent.parent / 'models' / os.path.basename(model_path)
+                    os.makedirs(dest.parent, exist_ok=True)
+                    if not Path(model_path).samefile(dest):
+                        import shutil
+                        shutil.copy2(model_path, str(dest))
+                    self.inference_model_path = str(dest)
+                except Exception:
+                    # fallback to original path
+                    self.inference_model_path = model_path
+
+                # start subprocess (if not already running)
+                started = self.start_inference_subprocess(self.inference_model_path)
+                if started:
+                    self.model_type = 'tensorflow'
+                    try:
+                        self.model_status_label.setText(f"Servidor de inferência ativo (porta {self.inference_port})")
+                    except Exception:
+                        pass
+                    return True
+        except Exception:
+            print("Modelo não carregado: formato desconhecido ou arquivo inexistente")
+            return False
+
+    def find_tf_models(self) -> List[str]:
+        """Procura por arquivos .keras/.h5 em locais comuns e retorna caminhos absolutos ordenados por data (mais recente primeiro)."""
+        current_dir = Path(__file__).parent.parent.parent
+        candidate_dirs = [
+            current_dir / 'bci' / 'models',
+            current_dir / 'models',
+            current_dir / 'files',
+            current_dir / 'HardThinking' / 'files',
+            Path(os.getcwd()) / 'bci' / 'models',
+        ]
+
+        found = []
+        for d in candidate_dirs:
+            try:
+                if d.exists():
+                    found.extend([str(p) for p in d.glob('*.keras')])
+                    found.extend([str(p) for p in d.glob('*.h5')])
+            except Exception:
+                continue
+
+        # Remover duplicatas e ordenar por mtime desc
+        unique = sorted(set(found), key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0, reverse=True)
+        return unique
+
+    def start_inference_subprocess(self, model_path: str) -> bool:
+        """Start a local inference subprocess that serves the Keras model over HTTP.
+
+        Returns True if the subprocess started (or already running).
+        """
+        try:
+            if self.inference_proc is not None and self.inference_proc.poll() is None:
+                # already running
+                return True
+
+            server_script = Path(__file__).parent.parent / 'inference' / 'keras_inference_server.py'
+            if not server_script.exists():
+                print(f'Inference server script not found: {server_script}')
+                return False
+
+            # Start subprocess in background
+            import subprocess
+            cmd = [sys.executable, str(server_script), '--model', str(model_path), '--port', str(self.inference_port)]
+            # On Windows, creationflags to open in new console isn't needed; run hidden
+            self.inference_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # give server short time to warm up
+            time.sleep(0.5)
+            return True
+        except Exception as e:
+            print(f'Failed to start inference subprocess: {e}')
+            return False
+
+    def stop_inference_subprocess(self):
+        try:
+            if self.inference_proc is not None:
+                self.inference_proc.terminate()
+                self.inference_proc.wait(timeout=2)
+                self.inference_proc = None
+        except Exception:
+            pass
             
     def update_game_stats(self):
         """Atualiza estatísticas do jogo"""
@@ -1048,21 +1396,52 @@ class StreamingWidget(QWidget):
                 channel_mean = np.mean(channel_data)
                 eeg_data[:, ch] = (channel_data - channel_mean) / iqr
             
-            # Transpor para (16, 400) e criar tensor
-            eeg_array = eeg_data.T
-            eeg_tensor = torch.FloatTensor(eeg_array).unsqueeze(0).unsqueeze(0)
-            eeg_tensor = eeg_tensor.to(self.device)
-            
-            # Predição
-            with torch.no_grad():
-                output = self.model(eeg_tensor)
-                probs = torch.softmax(output, dim=1)
-                pred = torch.argmax(probs, dim=1).item()
-                conf = probs[0][pred].item()
-                
-                # Probabilidades para cada classe
-                left_prob = probs[0][0].item()
-                right_prob = probs[0][1].item()
+            # Escolha entre inferência TensorFlow e PyTorch
+            if self.model_type == 'tensorflow':
+                # prefer in-process adapter if available
+                if self.tf_adapter is not None and self.model is not None:
+                    X = eeg_data.reshape(1, self.window_size, 16)
+                    probs = self.tf_adapter.predict_proba(self.model, X)
+                    pred = int(np.argmax(probs, axis=1)[0])
+                    conf = float(probs[0][pred])
+                    left_prob = float(probs[0][0])
+                    right_prob = float(probs[0][1])
+                else:
+                    # fallback: call local inference subprocess via HTTP
+                    try:
+                        import requests
+                        url = f'http://127.0.0.1:{self.inference_port}/predict'
+                        payload = {'data': eeg_data.tolist()}
+                        resp = requests.post(url, json=payload, timeout=1.0)
+                        if resp.status_code == 200:
+                            probs = resp.json().get('probs')
+                            probs = np.array(probs)
+                            pred = int(np.argmax(probs, axis=1)[0]) if probs.ndim == 2 else int(np.argmax(probs[0]))
+                            conf = float(probs[0][pred]) if probs.ndim == 2 else float(probs[pred])
+                            left_prob = float(probs[0][0]) if probs.ndim == 2 else float(probs[0])
+                            right_prob = float(probs[0][1]) if probs.ndim == 2 else float(probs[1])
+                        else:
+                            print(f'Inference server error: {resp.status_code} {resp.text}')
+                            return
+                    except Exception as e:
+                        print(f'Error calling inference server: {e}')
+                        return
+            else:
+                # Transpor para (16, 400) e criar tensor para PyTorch EEGNet
+                eeg_array = eeg_data.T
+                eeg_tensor = torch.FloatTensor(eeg_array).unsqueeze(0).unsqueeze(0)
+                eeg_tensor = eeg_tensor.to(self.device)
+
+                # Predição
+                with torch.no_grad():
+                    output = self.model(eeg_tensor)
+                    probs = torch.softmax(output, dim=1)
+                    pred = torch.argmax(probs, dim=1).item()
+                    conf = probs[0][pred].item()
+                    
+                    # Probabilidades para cada classe
+                    left_prob = probs[0][0].item()
+                    right_prob = probs[0][1].item()
             
             # Atualizar interface
             classes = ['🤚 Mão Esquerda', '✋ Mão Direita']
@@ -1175,11 +1554,36 @@ class StreamingWidget(QWidget):
             # Só atualizar o texto se não estiver gravando
             if task == "Jogo":
                 self.record_btn.setText("Iniciar Jogo")
-                # Carregar modelo se ainda não foi carregado
+                # Ao selecionar 'Jogo' apresentar lista de modelos .keras/.h5 encontrados para escolha
                 if self.model is None:
-                    if not self.load_model():
-                        self.task_combo.setCurrentText("Baseline")
-                        return
+                    try:
+                        candidates = self.find_tf_models()
+                    except Exception:
+                        candidates = []
+
+                    if candidates:
+                        # Mostrar diálogo para usuário escolher
+                        items = [os.path.basename(p) for p in candidates]
+                        item, ok = QInputDialog.getItem(self, "Selecionar Modelo", "Modelos TensorFlow encontrados:", items, 0, False)
+                        if ok and item:
+                            # map back to full path
+                            sel_index = items.index(item)
+                            sel_path = candidates[sel_index]
+                            loaded = self.load_model_from_path(sel_path)
+                            if loaded:
+                                QMessageBox.information(self, "Modelo carregado", f"Modelo carregado: {sel_path}")
+                            else:
+                                QMessageBox.warning(self, "Falha ao carregar", f"Falha ao carregar o modelo selecionado: {sel_path}")
+                        else:
+                            # Usuário cancelou seleção
+                            QMessageBox.information(self, "Nenhum modelo selecionado", "Nenhum modelo foi selecionado. Você pode treinar um modelo ou colocar um arquivo .keras em bci/models.")
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "Modelo não encontrado",
+                            "Nenhum modelo TensorFlow (.keras/.h5) foi encontrado em 'bci/models', 'files/' ou 'HardThinking/files'.\n"
+                            "Coloque um arquivo .keras em um desses diretórios ou treine um modelo via HardThinking."
+                        )
                 self.game_group.setVisible(True)
                 self.stats_group.setVisible(True)
                 self.accuracy_group.setVisible(True)  # Mostrar acurácia no jogo
@@ -1235,3 +1639,111 @@ class StreamingWidget(QWidget):
         else:
             print("[Unity] TCP desconectado")
             # Aqui você pode atualizar a UI para mostrar que o Unity foi desconectado
+    
+    def show_training_dialog(self, csv_file_path, patient_id, patient_name, auto_start: bool = False):
+        """Mostra o diálogo de confirmação e execução do treino"""
+        try:
+            # New API: auto_start to run training immediately and auto-load model when ready
+            dialog = TrainingDialog(csv_file_path, patient_id, patient_name, self)
+            # Propagar preferência para auto-start
+            dialog.auto_start = auto_start
+            # Conectar sinal de modelo pronto para carregar automaticamente
+            if hasattr(dialog, 'trainer_thread'):
+                pass
+
+            def _on_model_ready(path):
+                try:
+                    loaded = self.load_model_from_path(path)
+                    if loaded:
+                        QMessageBox.information(self, "Treino", f"Modelo treinado e carregado: {path}")
+                    else:
+                        QMessageBox.warning(self, "Treino", f"Modelo treinado, mas falha ao carregar: {path}")
+                except Exception as e:
+                    print(f"Erro ao carregar modelo treinado: {e}")
+
+            # If caller requested auto start, start training immediately and connect signals
+            # We inspect whether caller passed auto_start via attribute set on dialog (compatibility)
+            auto_start = getattr(dialog, 'auto_start', False)
+            if auto_start:
+                # start training and connect signals so the UI shows progress and final status
+                dialog.start_training()
+
+                # Connect model ready signal to loader
+                try:
+                    if dialog.trainer_thread and hasattr(dialog.trainer_thread, 'model_path_signal'):
+                        dialog.trainer_thread.model_path_signal.connect(_on_model_ready)
+                except Exception:
+                    pass
+
+                # Connect progress updates to the recording label so the user sees activity
+                try:
+                    if dialog.trainer_thread and hasattr(dialog.trainer_thread, 'progress_signal'):
+                        def _on_progress(msg):
+                            try:
+                                # Mostrar no label de gravação e no log do diálogo
+                                self.recording_label.setText(f"Treinamento: {msg}")
+                                self.recording_label.setStyleSheet("color: orange; font-weight: bold;")
+                                # também adicionar no log do diálogo
+                                try:
+                                    dialog.log_text.append(msg)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        dialog.trainer_thread.progress_signal.connect(_on_progress)
+                except Exception:
+                    pass
+
+                # Conectar finished_signal para notificar usuário caso load falhe
+                try:
+                    if dialog.trainer_thread and hasattr(dialog.trainer_thread, 'finished_signal'):
+                        def _on_finished(success, message):
+                            try:
+                                if success:
+                                    QMessageBox.information(self, "Treinamento", message)
+                                else:
+                                    QMessageBox.critical(self, "Treinamento", message)
+                                # Restaurar texto do label
+                                self.recording_label.setText("Não gravando")
+                                self.recording_label.setStyleSheet("color: gray;")
+                            except Exception:
+                                pass
+                        dialog.trainer_thread.finished_signal.connect(_on_finished)
+                except Exception:
+                    pass
+
+                # Mostrar diálogo em primeiro plano e garantir foco
+                dialog.show()
+                # Garantir que o diálogo de progresso mostre o log e o status imediatamente
+                try:
+                    dialog.progress_label.setVisible(True)
+                    dialog.progress_bar.setVisible(True)
+                    dialog.log_text.setVisible(True)
+                    dialog.log_text.append("Iniciando treinamento automaticamente...")
+                except Exception:
+                    pass
+
+                # Atualizar label principal para indicar início do treinamento
+                try:
+                    self.recording_label.setText("Treinamento: iniciando...")
+                    self.recording_label.setStyleSheet("color: orange; font-weight: bold;")
+                    QMessageBox.information(self, "Treinamento", "Treinamento iniciado automaticamente.")
+                except Exception:
+                    pass
+                try:
+                    dialog.raise_()
+                    dialog.activateWindow()
+                except Exception:
+                    pass
+                return
+
+            # Fallback: interactive mode
+            result = dialog.exec_()
+            if result == QDialog.Accepted:
+                print(f"Iniciando treino para paciente {patient_name} com arquivo {csv_file_path}")
+            else:
+                QMessageBox.information(self, "Sucesso", "Gravação de treino finalizada!")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao abrir diálogo de treino: {e}")
+            QMessageBox.information(self, "Sucesso", "Gravação de treino finalizada!")
