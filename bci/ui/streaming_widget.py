@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Optional, List
 from collections import deque
 import numpy as np
-import torch
 import sys
 import importlib
 from pathlib import Path
@@ -83,9 +82,7 @@ class StreamingWidget(QWidget):
 
     # Inicialização do modelo
         self.model = None
-        self.model_type = None  # 'pytorch' or 'tensorflow'
         self.tf_adapter = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # Default values; prefer HardThinking canonical config when available
         self.channels = 16
         # Force canonical window_size to 250 (HardThinking canonical)
@@ -1004,26 +1001,6 @@ class StreamingWidget(QWidget):
                 print(f"Carregando modelo TensorFlow encontrado: {chosen}")
                 return self.load_model_from_path(chosen)
 
-            # No TF models found — fallback to PyTorch .pth as before
-            pth_candidates = [
-                current_dir / 'bci' / 'models' / 'best_model.pth',
-                current_dir / 'bci' / 'models' / 'best_model.pt',
-                Path(os.getcwd()) / 'bci' / 'models' / 'best_model.pth',
-            ]
-            for p in pth_candidates:
-                try:
-                    if p.exists():
-                        # Try TorchScript load
-                        try:
-                            self.model = torch.jit.load(str(p), map_location=self.device)
-                            self.model_type = 'pytorch'
-                            print(f"Modelo PyTorch carregado: {p}")
-                            return True
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-
             QMessageBox.warning(self, "Erro", "Modelo não encontrado! (busca por .keras/.h5 em bci/models, files, HardThinking/files)")
             return False
         except Exception as e:
@@ -1196,16 +1173,6 @@ class StreamingWidget(QWidget):
                     self.model_expected_channels = None
 
                 return True
-
-            # Tentar PyTorch
-            if os.path.exists(model_path):
-                try:
-                    self.model = torch.jit.load(model_path, map_location=self.device)
-                    self.model_type = 'pytorch'
-                    print(f"Modelo PyTorch carregado: {model_path}")
-                    return True
-                except Exception as e:
-                    print(f"Falha ao carregar PyTorch: {e}")
 
         except Exception as e:
             print(f"Erro ao carregar modelo: {e}")
@@ -1469,7 +1436,7 @@ class StreamingWidget(QWidget):
                 channel_mean = np.mean(channel_data)
                 eeg_data[:, ch] = (channel_data - channel_mean) / iqr
             
-            # Escolha entre inferência TensorFlow e PyTorch
+            # Escolha entre inferência TensorFlow
             # Before inference, adapt eeg_data time dimension to model if necessary
             try:
                 target_time = getattr(self, 'model_expected_time', None)
@@ -1533,23 +1500,7 @@ class StreamingWidget(QWidget):
                     except Exception as e:
                         print(f'Error calling inference server: {e}')
                         return
-            else:
-                # Transpor para (channels, window_size) e criar tensor para PyTorch EEGNet
-                eeg_array = eeg_data.T
-                eeg_tensor = torch.FloatTensor(eeg_array).unsqueeze(0).unsqueeze(0)
-                eeg_tensor = eeg_tensor.to(self.device)
-
-                # Predição
-                with torch.no_grad():
-                    output = self.model(eeg_tensor)
-                    probs = torch.softmax(output, dim=1)
-                    pred = torch.argmax(probs, dim=1).item()
-                    conf = probs[0][pred].item()
                     
-                    # Probabilidades para cada classe
-                    left_prob = probs[0][0].item()
-                    right_prob = probs[0][1].item()
-            
             # Atualizar interface
             classes = ['🤚 Mão Esquerda', '✋ Mão Direita']
             timestamp = datetime.now()
@@ -1595,7 +1546,7 @@ class StreamingWidget(QWidget):
             self.eeg_buffer.append(eeg_data)
             self.samples_since_last_prediction += 1
             
-            # Fazer predição a cada 400 amostras
+            # Fazer predição a cada 250 amostras
             if len(self.eeg_buffer) >= self.window_size and self.samples_since_last_prediction >= self.window_size:
                 window_data = list(self.eeg_buffer)[-self.window_size:]
                 self.predict_movement(np.array(window_data))

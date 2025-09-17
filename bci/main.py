@@ -21,7 +21,7 @@ from typing import Optional, List, Dict, Any
 from collections import deque
 # Preload TensorFlow runtime (if installed) before importing any GUI or
 # other native-extension libraries. This reduces the chance of Windows
-# DLL initialization conflicts (common when mixing TF and PyTorch/PyQt).
+# DLL initialization conflicts (common when mixing TF and PyQt).
 try:
     import tensorflow as _tf
     print(f'Preloaded TensorFlow: {_tf.__version__}')
@@ -39,8 +39,6 @@ from PyQt5.QtGui import QFont, QPixmap, QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib import pyplot as plt
-import torch
-import torch.nn as nn
 import numpy as np
 import traceback
 # Detectar se estamos executando como módulo ou script direto

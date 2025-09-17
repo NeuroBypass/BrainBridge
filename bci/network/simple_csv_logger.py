@@ -52,9 +52,9 @@ class SimpleCSVLogger:
     def add_marker(self, marker_type):
         """Adiciona um marcador e programa T0 se necessário"""
         if marker_type in ['T1', 'T2']:
-            # Programar T0 para 400 amostras depois
+            # Programar T0 para 250 amostras depois
             self.pending_t0_marker = 'T0'
-            self.t0_samples_remaining = 400
+            self.t0_samples_remaining = 250
         return marker_type
     
     def _flush_buffer(self):
