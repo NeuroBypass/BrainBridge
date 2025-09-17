@@ -48,16 +48,40 @@ class ModelTrainerThread(QThread):
             # Localizar diretório HardThinking/src subindo a árvore a partir do projeto bci
             current_dir = Path(__file__).parent.parent
             hardthinking_src = None
-            for parent in current_dir.resolve().parents:
-                candidate = parent / 'HardThinking' / 'src'
+
+            # First try: climb a few levels from current_dir
+            probe = current_dir
+            for _ in range(6):
+                candidate = probe / 'HardThinking' / 'src'
                 if candidate.exists():
                     hardthinking_src = candidate
                     break
+                probe = probe.parent
+
+            # Second try: full parent chain
+            if hardthinking_src is None:
+                for parent in current_dir.resolve().parents:
+                    candidate = parent / 'HardThinking' / 'src'
+                    if candidate.exists():
+                        hardthinking_src = candidate
+                        break
+
+            # Third try: current working directory hierarchy
+            if hardthinking_src is None:
+                cwd = Path.cwd()
+                probe = cwd
+                for _ in range(6):
+                    candidate = probe / 'HardThinking' / 'src'
+                    if candidate.exists():
+                        hardthinking_src = candidate
+                        break
+                    probe = probe.parent
 
             if hardthinking_src is None:
-                msg = "Não foi possível localizar 'HardThinking/src'. Verifique se a pasta HardThinking está ao lado do projeto."
+                msg = "Não foi possível localizar 'HardThinking/src'. Verifique se a pasta HardThinking está ao lado do projeto ou ajuste PYTHONPATH."
                 if logger:
                     logger.error(msg)
+                    logger.error(f"Procurado em: {current_dir}, cwd={Path.cwd()}")
                 self.progress_signal.emit(msg)
                 self.finished_signal.emit(False, f"{msg} (ver detalhes no log: {log_file})" if log_file else msg)
                 return

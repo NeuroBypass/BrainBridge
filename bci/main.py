@@ -78,24 +78,11 @@ else:
 # Importar módulos do sistema existente
 import csv
 
-# Importar logger simples
-if __name__ == "__main__" and __package__ is None:
-    try:
-        from bci.network.simple_csv_logger import SimpleCSVLogger
-    except ImportError:
-        SimpleCSVLogger = None
-else:
-    try:
-        from .network.simple_csv_logger import SimpleCSVLogger
-    except ImportError:
-        SimpleCSVLogger = None
-
 # Não precisa adicionar ao path pois os módulos estão na mesma pasta agora
 if __name__ == "__main__" and __package__ is None:
     try:
         from bci.network.udp_receiver_BCI import UDPReceiver
         from bci.network.realtime_udp_converter import RealTimeUDPConverter
-        from bci.network.csv_data_logger import CSVDataLogger
         print("Módulos do sistema carregados com sucesso")
     except ImportError as e:
         print(f"Erro ao importar módulos: {e}")
@@ -104,7 +91,6 @@ else:
     try:
         from .network.udp_receiver_BCI import UDPReceiver
         from .network.realtime_udp_converter import RealTimeUDPConverter
-        from .network.csv_data_logger import CSVDataLogger
         print("Módulos do sistema carregados com sucesso")
     except ImportError as e:
         print(f"Erro ao importar módulos: {e}")
@@ -134,19 +120,6 @@ else:
             # Simular dados EEG para desenvolvimento
             return np.random.randn(16) * 50
     
-    # Usar nosso logger simples se disponível
-    if SimpleCSVLogger:
-        CSVDataLogger = SimpleCSVLogger
-    else:
-        # Criar um logger mock básico
-        class CSVDataLogger:
-            def __init__(self, filename): 
-                self.filename = filename
-            def start_logging(self): pass
-            def stop_logging(self): pass
-            def log_data(self, data): pass
-
-
 # Importar a janela principal
 if __name__ == "__main__" and __package__ is None:
     try:

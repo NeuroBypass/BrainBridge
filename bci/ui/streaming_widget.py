@@ -1,20 +1,14 @@
 import os
-import threading
-import time
-import zmq
-import socket
 from datetime import datetime
 from typing import Optional, List
 from collections import deque
 import numpy as np
-import sys
-import importlib
 from pathlib import Path
 import traceback
 import time
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                            QPushButton, QGroupBox, QComboBox, QGridLayout,
-                           QProgressBar, QTextEdit, QMessageBox, QCheckBox,
+                           QMessageBox, QCheckBox,
                            QLineEdit, QSpinBox, QDialog, QInputDialog)
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from ..database.database_manager import DatabaseManager
@@ -24,22 +18,60 @@ from .EEG_plot_widget import EEGPlotWidget
  # Prefer using HardThinking TensorFlow adapter for models
 try:
     import importlib, sys
-    # Add HardThinking/src to sys.path if it exists
+    # Robustly search for HardThinking/src: check current file tree and then parents
     p = Path(__file__).resolve()
     ht_src = None
+    # first check the current file ancestors including the folder that contains the project
+    candidates_to_check = [p]
+    # climb up a reasonable number of levels (6) from the current file
     for _ in range(6):
-        p = p.parent
-        candidate = p / 'HardThinking' / 'src'
+        candidates_to_check.append(candidates_to_check[-1].parent)
+
+    for base in candidates_to_check:
+        candidate = base / 'HardThinking' / 'src'
         if candidate.exists():
             ht_src = str(candidate)
             break
-    if ht_src and ht_src not in sys.path:
-        sys.path.insert(0, ht_src)
-    TensorFlowMLAdapter = importlib.import_module('infrastructure.adapters.tensorflow_ml_adapter').TensorFlowMLAdapter
+
+    # As a fallback, also check the resolved parent chain (covers some execution contexts)
+    if ht_src is None:
+        for parent in p.resolve().parents:
+            candidate = parent / 'HardThinking' / 'src'
+            if candidate.exists():
+                ht_src = str(candidate)
+                break
+
+    if ht_src:
+        # ensure both the src folder and its parent (HardThinking) are on sys.path
+        ht_path = Path(ht_src)
+        ht_parent = ht_path.parent
+        for pth in (str(ht_path), str(ht_parent)):
+            if pth not in sys.path:
+                sys.path.insert(0, pth)
+
+    # Try several possible module import names to be tolerant of package layout
+    TensorFlowMLAdapter = None
+    import_errors = []
+    for modname in ('infrastructure.adapters.tensorflow_ml_adapter', 'src.infrastructure.adapters.tensorflow_ml_adapter'):
+        try:
+            m = importlib.import_module(modname)
+            TensorFlowMLAdapter = getattr(m, 'TensorFlowMLAdapter', None)
+            if TensorFlowMLAdapter:
+                break
+        except Exception as e:
+            import_errors.append((modname, str(e)))
+    if TensorFlowMLAdapter is None:
+        # show brief debug info (not raising) so the app can continue without TF
+        try:
+            print('Aviso: HardThinking TensorFlow adapter não encontrado. Tentativas:')
+            for modname, err in import_errors:
+                print(f'  {modname}: {err}')
+        except Exception:
+            pass
 except Exception:
     TensorFlowMLAdapter = None
     print('Aviso: HardThinking TensorFlow adapter não encontrado. Funcionalidade de TF ficará indisponível.')
-from ..network.unity_communication import UDP_sender, UDP_receiver, UnityCommunicator
+from ..network.unity_communication import UDP_sender, UnityCommunicator
 from .training_dialog import TrainingDialog
 
 # Importar loggers
@@ -48,11 +80,6 @@ try:
     USE_OPENBCI_LOGGER = True
 except ImportError:
     USE_OPENBCI_LOGGER = False
-
-try:
-    from ..network.simple_csv_logger import SimpleCSVLogger
-except ImportError:
-    SimpleCSVLogger = None
 
 class StreamingWidget(QWidget):
     """Widget para streaming e gravação de dados"""
@@ -82,7 +109,6 @@ class StreamingWidget(QWidget):
 
     # Inicialização do modelo
         self.model = None
-        self.tf_adapter = None
         # Default values; prefer HardThinking canonical config when available
         self.channels = 16
         # Force canonical window_size to 250 (HardThinking canonical)
@@ -631,14 +657,7 @@ class StreamingWidget(QWidget):
                     filename = self.csv_logger.filename
                     # Mostrar caminho relativo para feedback visual
                     display_path = f"{self.csv_logger.patient_folder}/{filename}"
-                else:
-                    # Fallback para logger simples
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"patient_{self.current_patient_id}_{patient_name}_{timestamp}.csv"
-                    full_path = get_recording_path(filename)
-                    self.csv_logger = SimpleCSVLogger(str(full_path))
-                    self.csv_logger.start_logging()
-                    display_path = filename
+
                 
                 self.is_recording = True
                 self.update_record_button_text()  # Usar método que considera a tarefa
@@ -1014,33 +1033,60 @@ class StreamingWidget(QWidget):
         try:
             # Delegar para adapter TensorFlow se for .h5
             if model_path.endswith('.h5') or model_path.endswith('.keras'):
-                # localizar HardThinking adapter como em load_model
+                # locate HardThinking/src using a robust search (parents + cwd)
                 current_dir = Path(__file__).parent.parent.parent
                 hardthinking_src = None
-                for parent in current_dir.resolve().parents:
-                    candidate = parent / 'HardThinking' / 'src'
+
+                # First try: climb a few levels from current_dir
+                probe = current_dir
+                for _ in range(6):
+                    candidate = probe / 'HardThinking' / 'src'
                     if candidate.exists():
                         hardthinking_src = candidate
                         break
+                    probe = probe.parent
+
+                # Second try: full parent chain
+                if hardthinking_src is None:
+                    for parent in current_dir.resolve().parents:
+                        candidate = parent / 'HardThinking' / 'src'
+                        if candidate.exists():
+                            hardthinking_src = candidate
+                            break
+
+                # Third try: cwd chain
+                if hardthinking_src is None:
+                    cwd = Path.cwd()
+                    probe = cwd
+                    for _ in range(6):
+                        candidate = probe / 'HardThinking' / 'src'
+                        if candidate.exists():
+                            hardthinking_src = candidate
+                            break
+                        probe = probe.parent
 
                 if hardthinking_src is None:
+                    # Debug info to help the developer locate why the path wasn't found
                     print("Falha ao localizar HardThinking/src para carregar adapter TensorFlow")
+                    try:
+                        print(f"Debug: searched from current_dir={current_dir}, cwd={Path.cwd()}")
+                        import sys as _sys
+                        print("Debug sys.path:")
+                        for p in _sys.path:
+                            print(f"  {p}")
+                    except Exception:
+                        pass
                     return False
 
                 hardthinking_root = hardthinking_src.parent
-                if str(hardthinking_root) not in sys.path:
-                    sys.path.insert(0, str(hardthinking_root))
-
-                # Tornar a importação do adapter mais tolerante a diferentes estruturas de pacote
-                hardthinking_root = hardthinking_src.parent
-                # garantir ambos caminhos no sys.path (src e seu pai)
+                # ensure both src and its parent are on sys.path
                 for p in (str(hardthinking_src), str(hardthinking_root)):
                     if p not in sys.path:
                         sys.path.insert(0, p)
 
                 import_errors = []
                 TensorFlowMLAdapter = None
-                # Tentar importações em ordem provável
+                # Try several possible import names
                 import_candidates = [
                     'infrastructure.adapters.tensorflow_ml_adapter',
                     'src.infrastructure.adapters.tensorflow_ml_adapter',
@@ -1500,7 +1546,7 @@ class StreamingWidget(QWidget):
                     except Exception as e:
                         print(f'Error calling inference server: {e}')
                         return
-                    
+
             # Atualizar interface
             classes = ['🤚 Mão Esquerda', '✋ Mão Direita']
             timestamp = datetime.now()

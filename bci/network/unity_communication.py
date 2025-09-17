@@ -410,29 +410,6 @@ class UDP_sender:
                 return ip
         return all_ips[0] if all_ips else '127.0.0.1'
 
-
-class UDP_receiver:
-    """Classe de compatibilidade para recepção"""
-    
-    _communicator = UnityCommunicator()
-    
-    @staticmethod
-    def find_active_sender():
-        """Encontra sender ativo - para compatibilidade"""
-        return UDP_sender.get_all_ips()
-    
-    @staticmethod
-    def listen_for_broadcast(timeout=10.0):
-        """Para compatibilidade - retorna IPs locais"""
-        return UDP_receiver.find_active_sender()
-    
-    @staticmethod
-    def listen_for_broadcast_legacy():
-        """Versão legacy que retorna apenas o primeiro IP"""
-        ips = UDP_receiver.find_active_sender()
-        return ips[0] if ips else None
-
-
 # Função principal para demonstração
 def main():
     """Função principal para teste do sistema"""
